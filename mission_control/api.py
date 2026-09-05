@@ -162,6 +162,24 @@ def issue_agent_token(agent_id: int, db: Session = Depends(get_db)):
     return {"agent": a.handle, "token": token}
 
 
+@router.delete("/agents/{agent_id}", dependencies=[Depends(current_operator)])
+def delete_agent(agent_id: int, db: Session = Depends(get_db)):
+    """Permanently remove an agent from the roster.
+
+    Mission memberships cascade (mission_agents); references on tasks,
+    artifacts and approvals are nulled via their FK constraints.
+    """
+    a = db.get(Agent, agent_id)
+    if not a:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    for m in list(a.missions):
+        record_event(db, m.id, "human", None, "agent.removed", {"agent": a.handle})
+    handle = a.handle
+    db.delete(a)
+    db.commit()
+    return {"ok": True, "removed": handle}
+
+
 @router.post("/missions/{mission_id}/agents/{agent_id}", dependencies=[Depends(current_operator)])
 def add_agent_to_mission(mission_id: int, agent_id: int, db: Session = Depends(get_db)):
     m = _get_mission(db, mission_id)
