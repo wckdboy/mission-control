@@ -6,3 +6,8 @@ data/
 node_modules/
 web/dist/
 mission_control.db
+
+# secrets / local artifacts
+.venv/
+deploy.env
+agent-tokens.json
