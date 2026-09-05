@@ -1,0 +1,8 @@
+.venv
+__pycache__
+*.db
+data/
+.env
+node_modules/
+web/dist/
+mission_control.db

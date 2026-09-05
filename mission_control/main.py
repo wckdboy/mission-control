@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 
 from .config import settings
 from .db import SessionLocal, init_db
@@ -44,6 +46,25 @@ app.include_router(router)
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.api_route("/{full_path:path}", methods=["GET"], include_in_schema=False)
+def spa(full_path: str):
+    """Serve the built frontend (web/dist) with SPA fallback. API/health paths
+    keep their JSON 404s — this only catches non-API GET routes."""
+    if full_path.startswith(("api/", "health", "docs", "openapi.json")):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+    base = Path(settings.frontend_dist)
+    if not base.is_dir():
+        return JSONResponse({"detail": "frontend not built"}, status_code=404)
+    if full_path:
+        candidate = (base / full_path).resolve()
+        if base.resolve() in candidate.parents and candidate.is_file():
+            return FileResponse(candidate)
+    index = base / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
 
 
 @app.websocket("/ws/{room}")
