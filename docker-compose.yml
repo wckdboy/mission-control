@@ -31,7 +31,7 @@ services:
       OPERATOR_PASSWORD: ${MC_OPERATOR_PASSWORD:?set MC_OPERATOR_PASSWORD in .env}
       SESSION_SECRET: ${MC_SESSION_SECRET:?set MC_SESSION_SECRET in .env}
       PUBLIC_BASE_URL: ${MC_PUBLIC_BASE_URL:-http://localhost:8000}
-      AGENT_SEEDS: ${MC_AGENT_SEEDS:-jaeger=JAEGER=Data+Trials,percival=Percival=Evidence,bedivere=BEDIVERE=Integrity,galahad=GALAHAD=Coordination}
+      AGENT_SEEDS: ${MC_AGENT_SEEDS:-jaeger=JAEGER=Data+Trials,percival=Percival=Evidence,galahad=GALAHAD=Coordination}
       COOKIE_SECURE: ${MC_COOKIE_SECURE:-false}
       CORS_ORIGINS: ${MC_CORS_ORIGINS:-*}
       DATA_DIR: /srv/data
