@@ -118,6 +118,13 @@ def main() -> None:
     with client.websocket_connect(f"/ws/mission:{mid}") as ws:
         ws.send_text("ping")
 
+    # roster cleanup: DELETE agent (removes membership, nulls references)
+    r = client.delete(f"/api/agents/{pid}", cookies=jar)
+    assert r.status_code == 200, r.text
+    assert r.json()["removed"] == "percival"
+    handles = [a["handle"] for a in client.get("/api/agents", cookies=jar).json()]
+    assert "percival" not in handles, handles
+
     print("SMOKE OK — mission/task/agent/approval/artifact/timeline all green")
     print("INTERJECT OK — reassign/state/comment/nudge all green")
 
