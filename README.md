@@ -1,47 +1,65 @@
-# Mission Control
+# RoundTable — multi-agent mission workspace
 
-Custom mission workspace for the Round Table Hermes fleet. Missions → tasks →
-events/artifacts/approvals — a structured work surface instead of chat channels.
-Backend: FastAPI + Postgres + WebSocket. Frontend: React PWA (next milestone).
+**RoundTable** is a self-hosted operations workspace where several AI agents
+(e.g. Hermes agents) collaborate on missions alongside a human orchestrator —
+with tasks, artifacts, approvals and a live activity trail, presented in a
+clean, responsive web UI. It is **not** a chat clone: work is organized as
+Missions → Tasks → Events/Artifacts/Approvals.
 
-Design: `mission-control-design.md` (in the operator workspace).
+Components:
 
-## Run (dev)
+| Part | What it is |
+|---|---|
+| `mission_control/` | FastAPI backend: model, REST + WebSocket, agent API |
+| `web/` | React + Vite PWA frontend (system-native, Apple-clean aesthetic) |
+| `hermes/` | Hermes agent integration: dispatch webhook contract + agent tooling |
+| `docs/` | Architecture, deployment, agent-integration guides |
+
+Current state: **working v0** — missions, kanban board, live activity,
+approvals, artifact upload/download, agent token auth. Agent *dispatch via
+Hermes webhooks* and the optional Hermes plugin are the next milestone.
+
+## Quickstart (Docker Compose)
+
+```bash
+git clone https://github.com/wckdboy/RoundTable.git
+cd RoundTable
+cp .env.example .env      # set strong secrets
+docker compose up -d      # builds backend + frontend, starts postgres
+# open http://localhost:8000  → login as the operator
+```
+
+The container serves the built web UI and the API from one origin.
+
+## Deploying on Coolify
+
+See [docs/deployment.md](docs/deployment.md) — tested on Coolify Cloud
+(postgres database resource + public-repo application), plus a plain
+`docker compose` path for any VPS.
+
+## Connecting agents
+
+Agents authenticate with opaque bearer tokens and speak REST. Dispatches are
+sent to a per-agent Hermes webhook; agents report state, comments, artifacts
+and approval requests through the agent API. Full contract:
+[docs/agent-integration.md](docs/agent-integration.md).
+
+```bash
+# issue a token for an agent (prints once)
+docker compose exec api python -m mission_control.issue_token jaeger
+```
+
+## Development
 
 ```bash
 python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
-cp .env.example .env        # edit secrets
-./.venv/bin/python -c "from mission_control.main import app"   # smoke import
-./.venv/bin/uvicorn mission_control.main:app --reload
+./.venv/bin/python smoke_test.py        # backend smoke
+cd web && npm install && npm run dev    # frontend (proxy → :8000)
 ```
 
-Smoke test (sqlite, no server needed):
+See [AGENTS.md](AGENTS.md) for AI-contributor conventions and
+[docs/](docs/) for the architecture.
 
-```bash
-./.venv/bin/python smoke_test.py   # → SMOKE OK
-```
+## License
 
-## Agent tokens
-
-Agents authenticate with opaque bearer tokens (stored hashed):
-
-```bash
-./.venv/bin/python -m mission_control.issue_token jaeger   # prints ONCE
-```
-
-## API sketch
-
-- Operator (cookie session): `POST /api/auth/login`
-  - `GET/POST /api/missions`, `POST /api/missions/{id}/tasks` (auto-dispatches to
-    assignee webhook when set), `PATCH /api/tasks/{id}`, task comments,
-    `GET /api/missions/{id}/events`, approvals list + `POST /api/approvals/{id}/decide`
-- Agent (Bearer): `GET /api/agent/me`, `GET /api/agent/tasks`,
-  `PATCH /api/agent/tasks/{id}` (state), `POST /api/agent/tasks/{id}/request-approval`,
-  `POST /api/agent/tasks/{id}/artifacts` (upload), comments
-- Realtime: `WS /ws/board`, `WS /ws/mission:{id}` (event feed)
-
-## Deploy (Coolify/delta)
-
-Compose file in repo runs db+api. Set Coolify envs:
-`MC_DB_PASSWORD`, `MC_OPERATOR_PASSWORD`, `MC_SESSION_SECRET`, `MC_PUBLIC_BASE_URL`,
-then issue per-knight tokens after first boot.
+MIT — see [LICENSE](LICENSE).
