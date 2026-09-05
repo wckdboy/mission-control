@@ -50,13 +50,16 @@ def task_out(t: Task) -> dict:
     }
 
 
-def event_out(e: Event) -> dict:
+def event_out(e: Event, actor: str | None = None) -> dict:
+    """actor is the display handle; the WS payload includes it, so REST must too."""
     return {
         "id": e.id,
         "mission_id": e.mission_id,
         "task_id": e.task_id,
         "actor_type": e.actor_type,
         "actor_id": e.actor_id,
+        "actor": actor
+        or ("operator" if e.actor_type == "human" else "system" if e.actor_type == "system" else ""),
         "event_type": e.event_type,
         "payload": e.payload,
         "created_at": _iso(e.created_at),

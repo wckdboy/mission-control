@@ -1,6 +1,8 @@
 # dev smoke test — exercises core API against sqlite via TestClient
 import os
 import tempfile
+import threading
+import time
 
 os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(suffix=".db")
 os.environ["OPERATOR_PASSWORD"] = "test-password"
@@ -82,7 +84,42 @@ def main() -> None:
         assert want in types, (want, types)
     assert client.get(f"/api/artifacts/{art_id}/download", cookies=jar).status_code == 200
 
+    # ---- operator interjection surface (drives the board UI) ----
+    # second agent, for drag-to-reassign
+    pid = next(a["id"] for a in client.get("/api/agents", cookies=jar).json() if a["handle"] == "percival")
+    assert client.post(f"/api/missions/{mid}/agents/{pid}", cookies=jar).status_code == 200
+
+    # reassign (board drag -> PATCH assignee_agent_id) and confirm it stuck
+    r = client.patch(f"/api/tasks/{tid}", json={"assignee_agent_id": pid}, cookies=jar)
+    assert r.status_code == 200, r.text
+    assert client.get(f"/api/tasks/{tid}", cookies=jar).json()["assignee"] == "percival"
+
+    # state edit from the detail panel
+    assert client.patch(f"/api/tasks/{tid}", json={"state": "review"}, cookies=jar).status_code == 200
+
+    # operator comment + nudge (interject mid-build)
+    assert client.post(f"/api/tasks/{tid}/comments", json={"text": "tighten the citation format"}, cookies=jar).status_code == 200
+    r = client.post(f"/api/tasks/{tid}/nudge", json={"text": "status?"}, cookies=jar)
+    assert r.status_code == 200, r.text
+
+    # the board's serialized task must expose what the UI binds to
+    t = client.get(f"/api/tasks/{tid}", cookies=jar).json()
+    for field in ["assignee", "assignee_agent_id", "state", "title"]:
+        assert field in t, (field, sorted(t))
+
+    evs2 = [e["event_type"] for e in client.get(f"/api/missions/{mid}/events", cookies=jar).json()]
+    for want in ["task.reassigned", "operator.nudge"]:
+        assert want in evs2, (want, sorted(set(evs2)))
+
+    # live feed: authed websocket accepts a room connection
+    # (message delivery is verified post-deploy against the real uvicorn
+    #  server — TestClient's portal cannot faithfully multiplex WS + sync HTTP)
+    client.cookies.update(jar)
+    with client.websocket_connect(f"/ws/mission:{mid}") as ws:
+        ws.send_text("ping")
+
     print("SMOKE OK — mission/task/agent/approval/artifact/timeline all green")
+    print("INTERJECT OK — reassign/state/comment/nudge all green")
 
 
 if __name__ == "__main__":

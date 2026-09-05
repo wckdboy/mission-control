@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -29,6 +30,7 @@ def seed_defaults() -> None:
 async def lifespan(app: FastAPI):
     init_db()
     seed_defaults()
+    hub.bind_loop(asyncio.get_running_loop())
     yield
 
 
