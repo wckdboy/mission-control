@@ -20,7 +20,11 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import get_db
 from .deps import current_agent, current_operator
-from .dispatch import dispatch_task
+from .dispatch import (
+    build_interjection_payload,
+    dispatch_task,
+    notify_agent,
+)
 from .events import record_event
 from .models import Agent, Approval, Artifact, Event, Mission, Task
 from .security import check_operator_password, make_session_token, new_agent_token, sha256
@@ -249,27 +253,56 @@ def get_task(task_id: int, db: Session = Depends(get_db)):
 
 
 @router.patch("/tasks/{task_id}", dependencies=[Depends(current_operator)])
-def operator_update_task(task_id: int, body: dict, db: Session = Depends(get_db)):
+def operator_update_task(
+    task_id: int,
+    body: dict,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     t = _get_task(db, task_id)
-    old = t.state
+    old_state = t.state
+    old_assignee = t.assignee_agent_id
     if "state" in body:
         if body["state"] not in TASK_STATES:
             raise HTTPException(status_code=400, detail="Bad state")
         t.state = body["state"]
     if "assignee_agent_id" in body:
-        t.assignee_agent_id = body["assignee_agent_id"]
+        new_id = body["assignee_agent_id"]
+        if new_id is not None:
+            agent = db.get(Agent, new_id)
+            mission = db.get(Mission, t.mission_id)
+            if not agent or agent not in mission.agents:
+                raise HTTPException(status_code=400, detail="Assignee not in mission")
+        t.assignee_agent_id = new_id
+    if "title" in body and str(body["title"]).strip():
+        t.title = str(body["title"]).strip()
+    if "description" in body:
+        t.description = str(body["description"])
     db.commit()
     db.refresh(t)
-    if t.state != old:
+    if t.state != old_state:
         record_event(
             db, t.mission_id, "human", None, "task.state_change",
-            {"task_id": t.id, "from": old, "to": t.state}, task_id=t.id,
+            {"task_id": t.id, "from": old_state, "to": t.state}, task_id=t.id,
         )
+    if t.assignee_agent_id != old_assignee:
+        record_event(
+            db, t.mission_id, "human", None, "task.reassigned",
+            {"task_id": t.id, "to": t.assignee.handle if t.assignee else None}, task_id=t.id,
+        )
+        # A handover only counts if the new owner is told about it.
+        if t.assignee_agent_id:
+            background.add_task(dispatch_task, db, t)
     return task_out(t)
 
 
 @router.post("/tasks/{task_id}/comments", dependencies=[Depends(current_operator)])
-def operator_comment(task_id: int, body: dict, db: Session = Depends(get_db)):
+def operator_comment(
+    task_id: int,
+    body: dict,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     t = _get_task(db, task_id)
     text = (body.get("text") or "").strip()
     if not text:
@@ -278,7 +311,52 @@ def operator_comment(task_id: int, body: dict, db: Session = Depends(get_db)):
         db, t.mission_id, "human", None, "comment",
         {"task_id": t.id, "text": text}, task_id=t.id,
     )
+    # An interjection the agent never receives is just a note to ourselves.
+    _relay(background, db, t, "operator.comment", text)
     return {"ok": True}
+
+
+def _relay(
+    background: BackgroundTasks,
+    db: Session,
+    task: Task,
+    kind: str,
+    text: str,
+    extra: dict | None = None,
+) -> bool:
+    """Push an out-of-band message to the task's assignee, if reachable."""
+    if not task.assignee_agent_id:
+        return False
+    agent = db.get(Agent, task.assignee_agent_id)
+    if not agent or not agent.webhook_url:
+        return False
+    payload = build_interjection_payload(db, task, agent, kind, text, extra)
+    background.add_task(notify_agent, agent.webhook_url, payload)
+    return True
+
+
+class NudgeBody(BaseModel):
+    text: str
+
+
+@router.post("/tasks/{task_id}/nudge", dependencies=[Depends(current_operator)])
+def nudge_task(
+    task_id: int,
+    body: NudgeBody,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Steer a task mid-flight: recorded on the timeline and pushed to the agent."""
+    t = _get_task(db, task_id)
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty nudge")
+    record_event(
+        db, t.mission_id, "human", None, "operator.nudge",
+        {"task_id": t.id, "text": text}, task_id=t.id,
+    )
+    delivered = _relay(background, db, t, "operator.nudge", text)
+    return {"ok": True, "delivered": delivered}
 
 
 # ── timeline ────────────────────────────────────────────────────────────────
@@ -294,7 +372,11 @@ def mission_events(mission_id: int, db: Session = Depends(get_db)):
         .order_by(Event.created_at.asc())
         .all()
     )
-    return [event_out(e) for e in evs]
+    handles = {a.id: a.handle for a in db.query(Agent).all()}
+    return [
+        event_out(e, handles.get(e.actor_id) if e.actor_type == "agent" else None)
+        for e in evs
+    ]
 
 
 # ── approvals ───────────────────────────────────────────────────────────────
@@ -314,7 +396,12 @@ class DecideBody(BaseModel):
 
 
 @router.post("/approvals/{approval_id}/decide", dependencies=[Depends(current_operator)])
-def decide_approval(approval_id: int, body: DecideBody, db: Session = Depends(get_db)):
+def decide_approval(
+    approval_id: int,
+    body: DecideBody,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     ap = db.get(Approval, approval_id)
     if not ap:
         raise HTTPException(status_code=404, detail="Approval not found")
@@ -329,6 +416,13 @@ def decide_approval(approval_id: int, body: DecideBody, db: Session = Depends(ge
         db, task.mission_id, "human", None, "approval.decided",
         {"approval_id": ap.id, "task_id": task.id, "approved": body.approve, "note": body.note},
         task_id=task.id,
+    )
+    # Without this the agent blocks on an approval that was already decided.
+    verdict = "APPROVED" if body.approve else "REJECTED"
+    _relay(
+        background, db, task, "approval.decided",
+        f"{verdict}: {body.note}" if body.note else verdict,
+        {"approved": body.approve, "approval_id": ap.id},
     )
     return approval_out(ap)
 

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 
@@ -12,6 +13,19 @@ class RoomHub:
 
     def __init__(self) -> None:
         self._rooms: dict[str, set[WebSocket]] = {}
+        # Endpoints are sync (`def`), so they run in a threadpool with no running
+        # loop. The loop is captured at startup so those handlers can still publish.
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def publish_soon(self, room: str, message: dict[str, Any]) -> None:
+        """Schedule a publish from any thread. No-op if the loop isn't up yet."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        asyncio.run_coroutine_threadsafe(self.publish(room, message), loop)
 
     async def connect(self, room: str, ws: WebSocket) -> None:
         await ws.accept()
@@ -73,13 +87,7 @@ def record_event(
         "payload": ev.payload,
         "created_at": ev.created_at.isoformat(),
     }
-    # fire-and-forget publish
-    import asyncio
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(hub.publish(f"mission:{mission_id}", {"kind": "event", "event": out}))
-        loop.create_task(hub.publish("board", {"kind": "mission.update", "mission_id": mission_id}))
-    except RuntimeError:
-        pass
+    # fire-and-forget publish (safe from threadpool threads: loop bound at startup)
+    hub.publish_soon(f"mission:{mission_id}", {"kind": "event", "event": out})
+    hub.publish_soon("board", {"kind": "mission.update", "mission_id": mission_id})
     return ev

@@ -34,4 +34,49 @@ export const api = {
   decideApproval: (aid, approve, note) =>
     req("POST", `/api/approvals/${aid}/decide`, { approve, note: note || "" }),
   artifacts: (mid) => req("GET", `/api/missions/${mid}/artifacts`),
+  nudgeTask: (tid, text) => req("POST", `/api/tasks/${tid}/nudge`, { text }),
+  updateTask: (tid, patchBody) => req("PATCH", `/api/tasks/${tid}`, patchBody),
+  logout: () => req("POST", "/api/auth/logout"),
 };
+
+/** Live mission stream. Falls back to caller-supplied refetch on drop. */
+export function openStream(room, { onMessage, onStatus }) {
+  let ws = null;
+  let closed = false;
+  let attempt = 0;
+  let timer = null;
+  let ping = null;
+
+  const connect = () => {
+    if (closed) return;
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}/ws/${room}`);
+    ws.onopen = () => {
+      attempt = 0;
+      onStatus?.("live");
+      ping = setInterval(() => ws?.readyState === 1 && ws.send("ping"), 25000);
+    };
+    ws.onmessage = (e) => {
+      try {
+        onMessage?.(JSON.parse(e.data));
+      } catch {}
+    };
+    ws.onclose = () => {
+      clearInterval(ping);
+      if (closed) return;
+      onStatus?.("reconnecting");
+      // Exponential backoff, capped — a dead tab shouldn't hammer the server.
+      const delay = Math.min(1000 * 2 ** attempt++, 15000);
+      timer = setTimeout(connect, delay);
+    };
+    ws.onerror = () => ws?.close();
+  };
+  connect();
+
+  return () => {
+    closed = true;
+    clearTimeout(timer);
+    clearInterval(ping);
+    ws?.close();
+  };
+}

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { api } from "./api";
+import { api, openStream } from "./api";
 import "./styles.css";
 
 /* ---------- tiny helpers ---------- */
@@ -227,16 +227,21 @@ function MissionRoute({ missionId, onBack }) {
   const [events, setEvents] = useState([]);
   const [approvals, setApprovals] = useState([]);
   const [artifacts, setArtifacts] = useState([]);
-  const [sheet, setSheet] = useState(null); // task id
+  const [sheet, setSheet] = useState(null);
   const [notice, setNotice] = useState(null);
   const [err, setErr] = useState(null);
+  const [link, setLink] = useState("connecting");
+  const [view, setView] = useState("board"); // board | lanes
+  const [drag, setDrag] = useState(null); // {id, from}
+  const [over, setOver] = useState(null);
   const [draft, setDraft] = useState({ title: "", desc: "", assignee: "" });
   const toastTimer = useRef(null);
+  const feedRef = useRef(null);
 
   const notify = (msg) => {
     setNotice(msg);
     clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setNotice(null), 4000);
+    toastTimer.current = setTimeout(() => setNotice(null), 3500);
   };
 
   const load = useCallback(async () => {
@@ -252,11 +257,29 @@ function MissionRoute({ missionId, onBack }) {
     }
   }, [missionId]);
 
+  // One fetch for the snapshot, then the socket keeps us honest — no 5s polling.
   useEffect(() => {
     load();
-    const iv = setInterval(load, 5000);
-    return () => clearInterval(iv);
-  }, [load]);
+    const close = openStream(`mission:${missionId}`, {
+      onStatus: setLink,
+      onMessage: (msg) => {
+        if (msg.kind === "event" && msg.event) {
+          setEvents((prev) => (prev.some((e) => e.id === msg.event.id) ? prev : [...prev, msg.event]));
+          // Board/approval shape changed — refetch just the affected slices.
+          const t = msg.event.event_type || "";
+          if (t.startsWith("task.") || t.startsWith("approval.") || t.startsWith("artifact.")) load();
+        }
+      },
+    });
+    return close;
+  }, [missionId, load]);
+
+  // Keep the feed pinned to the newest line unless the operator scrolled up.
+  useEffect(() => {
+    const el = feedRef.current;
+    if (!el) return;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 120) el.scrollTop = el.scrollHeight;
+  }, [events]);
 
   const dispatch = async (e) => {
     e.preventDefault();
@@ -268,7 +291,7 @@ function MissionRoute({ missionId, onBack }) {
         assignee_agent_id: draft.assignee ? Number(draft.assignee) : null,
       });
       setDraft({ title: "", desc: "", assignee: "" });
-      notify(`Dispatched "${t.title}"${t.assignee ? " → " + t.assignee : ""}`);
+      notify(`Dispatched “${t.title}”${t.assignee ? " → @" + t.assignee : ""}`);
       load();
     } catch (ex) {
       setErr(String(ex.message || ex));
@@ -276,110 +299,232 @@ function MissionRoute({ missionId, onBack }) {
   };
 
   const decide = async (ap, ok) => {
-    await api.decideApproval(ap.id, ok, ok ? "" : "rejected by operator");
-    notify(ok ? "Approval granted" : "Approval rejected");
-    load();
+    try {
+      await api.decideApproval(ap.id, ok, ok ? "" : "rejected by operator");
+      notify(ok ? "Approved — agent unblocked" : "Rejected — agent notified");
+      load();
+    } catch (ex) {
+      setErr(String(ex.message || ex));
+    }
+  };
+
+  const moveTask = async (id, state) => {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, state } : t))); // optimistic
+    try {
+      await api.setTaskState(id, state);
+    } catch (ex) {
+      setErr(String(ex.message || ex));
+      load();
+    }
+  };
+
+  const reassign = async (id, agentId) => {
+    try {
+      await api.updateTask(id, { assignee_agent_id: agentId });
+      notify(agentId ? "Reassigned — new owner dispatched" : "Unassigned");
+      load();
+    } catch (ex) {
+      setErr(String(ex.message || ex));
+      load();
+    }
   };
 
   if (!mission) return <div className="boot"><Logo /></div>;
   const roster = mission.agents;
+  const byState = (s) => tasks.filter((t) => t.state === s);
+  const activeCount = byState("in_progress").length;
 
   return (
     <div className="ws">
-      <aside className="ws-back" onClick={onBack} aria-label="Back to missions">
+      <aside className="ws-back" onClick={onBack} aria-label="Back to missions" role="button" tabIndex={0}
+        onKeyDown={(e) => e.key === "Enter" && onBack()}>
         <svg viewBox="0 0 16 16" width="14" height="14"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>
       </aside>
 
       <main className="ws-main">
         <header className="ws-head">
           <div className="ws-title">
-            <span className={cls("pill", mission.status)}>{mission.status}</span>
+            <div className="ws-crumb">
+              <span className={cls("pill", mission.status)}>{mission.status}</span>
+              <span className={cls("link-dot", link)} title={`Stream ${link}`} />
+              <span className="link-lbl">{link === "live" ? "live" : link}</span>
+            </div>
             <h1>{mission.name}</h1>
             {mission.description && <p className="sub">{mission.description}</p>}
           </div>
-          <div className="ws-agents">
-            {roster.map((a) => (
-              <div key={a.id} className="ws-agent" title={`${a.handle} — ${a.role}`}>
-                <Avatar agent={a} size={30} />
-                <StatusDot status={a.status} pulse />
-              </div>
-            ))}
+          <div className="ws-headright">
+            <div className="ws-stats">
+              <span><b>{activeCount}</b> active</span>
+              <span><b>{byState("done").length}</b>/{tasks.length} done</span>
+            </div>
+            <div className="segmented" role="tablist">
+              <button role="tab" aria-selected={view === "board"} className={cls(view === "board" && "on")} onClick={() => setView("board")}>Board</button>
+              <button role="tab" aria-selected={view === "lanes"} className={cls(view === "lanes" && "on")} onClick={() => setView("lanes")}>Agents</button>
+            </div>
           </div>
         </header>
 
+        <div className="ws-progress" aria-hidden>
+          {COLUMNS.map(([s]) => {
+            const n = byState(s).length;
+            return n ? <span key={s} className={cls("seg", s)} style={{ flexGrow: n }} /> : null;
+          })}
+        </div>
+
         {approvals.length > 0 && (
-          <div className="approval-strip">
+          <div className="approval-strip" role="alert">
             <span className="strip-ico">!</span>
             <div className="strip-body">
-              {approvals.map((ap) => (
-                <div key={ap.id} className="strip-item">
-                  <b>Approval</b> on task “{tasks.find((t) => t.id === ap.task_id)?.title || `#${ap.task_id}`}”
-                  {ap.note && <em> — {ap.note}</em>}
-                  <div className="row">
-                    <button className="mini ok" onClick={() => decide(ap, true)}>Approve</button>
-                    <button className="mini bad" onClick={() => decide(ap, false)}>Reject</button>
+              {approvals.map((ap) => {
+                const t = tasks.find((x) => x.id === ap.task_id);
+                return (
+                  <div key={ap.id} className="strip-item">
+                    <div className="strip-text">
+                      <b>{t?.assignee ? "@" + t.assignee : "An agent"}</b> needs approval on “{t?.title || `#${ap.task_id}`}”
+                      {ap.note && <em> — {ap.note}</em>}
+                    </div>
+                    <div className="row">
+                      <button className="mini ok" onClick={() => decide(ap, true)}>Approve</button>
+                      <button className="mini bad" onClick={() => decide(ap, false)}>Reject</button>
+                      <button className="mini" onClick={() => setSheet(ap.task_id)}>Open</button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
 
         <form className="composer" onSubmit={dispatch}>
-          <input placeholder="What should be done?" value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
-          <input className="desc" placeholder="Context / brief (optional)" value={draft.desc} onChange={(e) => setDraft({ ...draft, desc: e.target.value })} />
-          <select value={draft.assignee} onChange={(e) => setDraft({ ...draft, assignee: e.target.value })}>
+          <input placeholder="What should be done?" value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} aria-label="Task title" />
+          <input className="desc" placeholder="Context / brief (optional)" value={draft.desc} onChange={(e) => setDraft({ ...draft, desc: e.target.value })} aria-label="Task brief" />
+          <select value={draft.assignee} onChange={(e) => setDraft({ ...draft, assignee: e.target.value })} aria-label="Assignee">
             <option value="">Assign…</option>
             {roster.map((a) => <option key={a.id} value={a.id}>{a.handle}</option>)}
           </select>
-          <button className="primary">Dispatch</button>
+          <button className="primary" disabled={!draft.title.trim()}>Dispatch</button>
         </form>
 
-        <div className="board-scroll">
-          <div className="board">
-            {COLUMNS.map(([state, label]) => {
-              const col = tasks.filter((t) => t.state === state);
+        {view === "board" ? (
+          <div className="board-scroll">
+            <div className="board">
+              {COLUMNS.map(([state, label]) => {
+                const col = byState(state);
+                return (
+                  <section
+                    className={cls("bcol", over === state && "over")}
+                    key={state}
+                    onDragOver={(e) => { e.preventDefault(); setOver(state); }}
+                    onDragLeave={() => setOver((s) => (s === state ? null : s))}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      setOver(null);
+                      if (drag && drag.from !== state) moveTask(drag.id, state);
+                      setDrag(null);
+                    }}
+                  >
+                    <header className="bcol-head">
+                      <span className={cls("bcol-dot", state)} />
+                      <span>{label}</span>
+                      <span className="bcount">{col.length}</span>
+                    </header>
+                    <div className="bcol-body">
+                      {col.map((t) => (
+                        <TaskCard
+                          key={t.id}
+                          task={t}
+                          dragging={drag?.id === t.id}
+                          onOpen={() => setSheet(t.id)}
+                          onDragStart={() => setDrag({ id: t.id, from: state })}
+                          onDragEnd={() => { setDrag(null); setOver(null); }}
+                          onMove={moveTask}
+                        />
+                      ))}
+                      {!col.length && <div className="bempty">{over === state ? "Drop here" : ""}</div>}
+                    </div>
+                  </section>
+                );
+              })}
+            </div>
+          </div>
+        ) : (
+          <div className="lanes">
+            {roster.map((a) => {
+              const mine = tasks.filter((t) => t.assignee === a.handle && t.state !== "done");
+              const now = mine.find((t) => t.state === "in_progress");
               return (
-                <section className="bcol" key={state}>
-                  <header className="bcol-head">
-                    <span className="bcol-dot" style={{ background: "var(--line-strong)" }} />
-                    <span>{label}</span>
-                    <span className="bcount">{col.length}</span>
+                <section key={a.id}
+                  onDragOver={(e) => { e.preventDefault(); setOver("lane" + a.id); }}
+                  onDragLeave={() => setOver((s) => (s === "lane" + a.id ? null : s))}
+                  onDrop={(e) => { e.preventDefault(); setOver(null); if (drag) reassign(drag.id, a.id); setDrag(null); }}
+                  className={cls("lane", over === "lane" + a.id && "over")}
+                >
+                  <header className="lane-head">
+                    <Avatar agent={a} size={30} />
+                    <div className="lane-id">
+                      <b>{a.handle}</b>
+                      <span className="sub">{a.role || "agent"}</span>
+                    </div>
+                    <StatusDot status={a.status} pulse />
                   </header>
-                  <div className="bcol-body">
-                    {col.map((t) => (
-                      <button key={t.id} className="tcard" onClick={() => setSheet(t.id)}>
-                        <div className="tcard-top">
-                          <span className="tag" style={{ color: t.assignee ? colorFor(t.assignee) : undefined }}>
-                            {t.assignee ? "@" + t.assignee : "unassigned"}
-                          </span>
-                          <span className="tid">#{t.id}</span>
-                        </div>
-                        <div className="tcard-title">{t.title}</div>
-                        {t.description && <div className="tcard-desc">{t.description}</div>}
-                        <div className="tcard-foot">{fmt(t.updated_at)}</div>
+                  <div className="lane-now">
+                    {now ? (
+                      <button className="now-card" onClick={() => setSheet(now.id)}>
+                        <span className="now-lbl">working on</span>
+                        <span className="now-title">{now.title}</span>
                       </button>
+                    ) : (
+                      <div className="now-idle">{a.status === "awaiting_approval" ? "waiting on you" : "idle"}</div>
+                    )}
+                  </div>
+                  <div className="lane-body">
+                    {mine.filter((t) => t.id !== now?.id).map((t) => (
+                      <TaskCard key={t.id} task={t} compact
+                        dragging={drag?.id === t.id}
+                        onOpen={() => setSheet(t.id)}
+                        onDragStart={() => setDrag({ id: t.id, from: t.state })}
+                        onDragEnd={() => { setDrag(null); setOver(null); }}
+                        onMove={moveTask} />
                     ))}
-                    {!col.length && <div className="bempty" />}
+                    {!mine.length && <div className="empty small">Nothing queued</div>}
                   </div>
                 </section>
               );
             })}
+            <section className={cls("lane unassigned", over === "laneNull" && "over")}
+              onDragOver={(e) => { e.preventDefault(); setOver("laneNull"); }}
+              onDragLeave={() => setOver((s) => (s === "laneNull" ? null : s))}
+              onDrop={(e) => { e.preventDefault(); setOver(null); if (drag) reassign(drag.id, null); setDrag(null); }}>
+              <header className="lane-head"><div className="lane-id"><b>Unassigned</b><span className="sub">drop to park</span></div></header>
+              <div className="lane-body">
+                {tasks.filter((t) => !t.assignee && t.state !== "done").map((t) => (
+                  <TaskCard key={t.id} task={t} compact
+                    dragging={drag?.id === t.id}
+                    onOpen={() => setSheet(t.id)}
+                    onDragStart={() => setDrag({ id: t.id, from: t.state })}
+                    onDragEnd={() => { setDrag(null); setOver(null); }}
+                    onMove={moveTask} />
+                ))}
+              </div>
+            </section>
           </div>
-        </div>
+        )}
       </main>
 
       <aside className="ws-rail">
-        <div className="rail-block">
-          <span className="rail-lbl">Live activity</span>
-          <div className="feed">
-            {events.slice().reverse().map((ev) => (
+        <div className="rail-block grow">
+          <span className="rail-lbl">
+            Live activity
+            <span className={cls("link-dot", link)} />
+          </span>
+          <div className="feed" ref={feedRef}>
+            {events.map((ev) => (
               <div className={cls("feed-item", ev.actor_type)} key={ev.id}>
-                <Avatar agent={{ handle: ev.actor }} size={20} />
+                <Avatar agent={{ handle: ev.actor || "system" }} size={20} />
                 <div className="feed-body">
-                  <div className="feed-line"><b>{ev.actor}</b> {actionLabel(ev)}</div>
+                  <div className="feed-line"><b>{ev.actor || "system"}</b> {actionLabel(ev)}</div>
                   {ev.payload?.text && <div className="feed-text">{ev.payload.text}</div>}
-                  {ev.payload?.title && <div className="feed-text">“{ev.payload.title}”</div>}
+                  {ev.payload?.title && !ev.payload?.text && <div className="feed-text">“{ev.payload.title}”</div>}
                   <div className="feed-time">{fmt(ev.created_at)}</div>
                 </div>
               </div>
@@ -401,7 +546,55 @@ function MissionRoute({ missionId, onBack }) {
       </aside>
 
       {notice && <div className="toast">{notice}</div>}
-      {sheet !== null && <TaskSheet taskId={sheet} tasks={tasks} events={events} artifacts={artifacts} agents={agents} onClose={() => setSheet(null)} onChanged={() => { setSheet(null); load(); }} onError={setErr} />}
+      {sheet !== null && (
+        <TaskSheet taskId={sheet} tasks={tasks} events={events} artifacts={artifacts} agents={agents}
+          roster={roster}
+          onClose={() => setSheet(null)}
+          onChanged={load}
+          onReassign={reassign}
+          onNotify={notify}
+          onError={setErr} />
+      )}
+    </div>
+  );
+}
+
+/* ---------- task card ---------- */
+function TaskCard({ task, onOpen, onDragStart, onDragEnd, onMove, dragging, compact }) {
+  const next = STATE_NEXT[task.state];
+  const prev = STATE_PREV[task.state];
+  return (
+    <div
+      className={cls("tcard", dragging && "dragging", compact && "compact")}
+      draggable
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      onClick={onOpen}
+      role="button"
+      tabIndex={0}
+      aria-label={`${task.title}, ${task.state}`}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") onOpen();
+        // Keyboard parity for drag-and-drop.
+        if (e.key === "ArrowRight" && next) { e.preventDefault(); onMove(task.id, next); }
+        if (e.key === "ArrowLeft" && prev) { e.preventDefault(); onMove(task.id, prev); }
+      }}
+    >
+      <div className="tcard-top">
+        <span className="tag" style={{ color: task.assignee ? colorFor(task.assignee) : undefined }}>
+          {task.assignee ? "@" + task.assignee : "unassigned"}
+        </span>
+        <span className="tid">#{task.id}</span>
+      </div>
+      <div className="tcard-title">{task.title}</div>
+      {!compact && task.description && <div className="tcard-desc">{task.description}</div>}
+      <div className="tcard-foot">
+        <span>{fmt(task.updated_at)}</span>
+        <span className="tcard-move">
+          {prev && <button className="chev" title={`Move to ${prev}`} onClick={(e) => { e.stopPropagation(); onMove(task.id, prev); }}>‹</button>}
+          {next && <button className="chev" title={`Move to ${next}`} onClick={(e) => { e.stopPropagation(); onMove(task.id, next); }}>›</button>}
+        </span>
+      </div>
     </div>
   );
 }
@@ -409,7 +602,9 @@ function MissionRoute({ missionId, onBack }) {
 function actionLabel(ev) {
   const map = {
     "task.created": "created task",
-    "task.state_change": `moved task ${ev.payload?.task_id != null ? "#" + ev.payload.task_id : ""} ${ev.payload?.from ? ev.payload.from + " → " : ""}${ev.payload?.to || ""}`,
+    "task.state_change": `moved task ${ev.payload?.task_id != null ? "#" + ev.payload.task_id : ""} ${ev.payload?.from ? ev.payload.from + " \u2192 " : ""}${ev.payload?.to || ""}`,
+    "task.reassigned": `reassigned to ${ev.payload?.to ? "@" + ev.payload.to : "nobody"}`,
+    "task.nudged": "steered the agent",
     "comment": "commented",
     "approval.requested": "requested approval",
     "approval.decided": "approval " + (ev.payload?.approved ? "approved" : "rejected"),
@@ -419,22 +614,31 @@ function actionLabel(ev) {
     "agent.added": "joined the mission",
     "agent.removed": "left the mission",
   };
-  return map[ev.event_type] || ev.event_type.replaceAll("_", " ");
+  return map[ev.event_type] || String(ev.event_type || "").replaceAll("_", " ").replaceAll(".", " ");
 }
 
 /* ---------- task detail sheet ---------- */
-function TaskSheet({ taskId, tasks, events, artifacts, agents, onClose, onChanged, onError }) {
+function TaskSheet({ taskId, tasks, events, artifacts, agents, roster, onClose, onChanged, onReassign, onNotify, onError }) {
   const task = tasks.find((t) => t.id === taskId);
   const [text, setText] = useState("");
+  const [mode, setMode] = useState("nudge"); // nudge = steer the agent | note = record only
+  const [busy, setBusy] = useState(false);
+  const feedRef = useRef(null);
+
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  const related = events.filter((e) => e.task_id === taskId);
+  useEffect(() => {
+    const el = feedRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [related.length]);
+
   if (!task) return null;
   const agent = agents.find((a) => a.handle === task.assignee);
-  const related = events.filter((e) => e.task_id === task.id);
   const arts = artifacts.filter((a) => a.task_id === task.id);
 
   const setState = async (s) => {
@@ -445,24 +649,37 @@ function TaskSheet({ taskId, tasks, events, artifacts, agents, onClose, onChange
       onError(String(ex.message || ex));
     }
   };
-  const comment = async (e) => {
+
+  const send = async (e) => {
     e.preventDefault();
-    if (!text.trim()) return;
+    const body = text.trim();
+    if (!body || busy) return;
+    setBusy(true);
     try {
-      await api.commentTask(task.id, text);
+      if (mode === "nudge") {
+        const r = await api.nudgeTask(task.id, body);
+        onNotify?.(r?.delivered ? `Sent to @${task.assignee}` : "Recorded — agent not reachable");
+      } else {
+        await api.commentTask(task.id, body);
+        onNotify?.("Note added");
+      }
       setText("");
       onChanged();
     } catch (ex) {
       onError(String(ex.message || ex));
+    } finally {
+      setBusy(false);
     }
   };
+
   const upload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const fd = new FormData();
     fd.append("file", file);
     try {
-      await fetch(`/api/tasks/${task.id}/artifacts`, { method: "POST", body: fd, credentials: "same-origin" });
+      const res = await fetch(`/api/tasks/${task.id}/artifacts`, { method: "POST", body: fd, credentials: "same-origin" });
+      if (!res.ok) throw new Error(`upload failed (${res.status})`);
       e.target.value = "";
       onChanged();
     } catch (ex) {
@@ -472,7 +689,7 @@ function TaskSheet({ taskId, tasks, events, artifacts, agents, onClose, onChange
 
   return (
     <div className="scrim" onClick={onClose}>
-      <div className="sheet" onClick={(e) => e.stopPropagation()}>
+      <div className="sheet" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={task.title}>
         <div className="sheet-head">
           <div className="sheet-title">
             <span className={cls("pill", task.state)}>{task.state.replace("_", " ")}</span>
@@ -484,6 +701,15 @@ function TaskSheet({ taskId, tasks, events, artifacts, agents, onClose, onChange
 
         <div className="sheet-assignee">
           {agent ? <><Avatar agent={agent} size={22} /> <b>{agent.handle}</b><span className="sub"> · {agent.role}</span></> : <span className="sub">Unassigned</span>}
+          <select
+            className="reassign"
+            value={task.assignee_agent_id || ""}
+            onChange={(e) => onReassign?.(task.id, e.target.value ? Number(e.target.value) : null)}
+            aria-label="Reassign task"
+          >
+            <option value="">Unassigned</option>
+            {(roster || []).map((a) => <option key={a.id} value={a.id}>{a.handle}</option>)}
+          </select>
         </div>
 
         <div className="sheet-controls">
@@ -491,6 +717,7 @@ function TaskSheet({ taskId, tasks, events, artifacts, agents, onClose, onChange
           {task.state !== "todo" && <button className="mini" onClick={() => setState("todo")}>← To Do</button>}
           {task.state !== "in_progress" && <button className="mini" onClick={() => setState("in_progress")}>In Progress</button>}
           {task.state !== "review" && <button className="mini" onClick={() => setState("review")}>Review</button>}
+          {task.state !== "blocked" && <button className="mini bad" onClick={() => setState("blocked")}>Blocked</button>}
           {task.state !== "done" && <button className="mini ok" onClick={() => setState("done")}>Done ✓</button>}
         </div>
 
@@ -506,23 +733,38 @@ function TaskSheet({ taskId, tasks, events, artifacts, agents, onClose, onChange
           </div>
         )}
 
-        <div className="sheet-feed">
+        <div className="sheet-feed" ref={feedRef}>
           <span className="lbl">Activity</span>
-          {related.slice().reverse().map((ev) => (
+          {related.map((ev) => (
             <div className={cls("feed-item", ev.actor_type)} key={ev.id}>
-              <Avatar agent={{ handle: ev.actor }} size={20} />
+              <Avatar agent={{ handle: ev.actor || "system" }} size={20} />
               <div className="feed-body">
-                <div className="feed-line"><b>{ev.actor}</b> {actionLabel(ev)}</div>
+                <div className="feed-line"><b>{ev.actor || "system"}</b> {actionLabel(ev)}</div>
                 {ev.payload?.text && <div className="feed-text">{ev.payload.text}</div>}
                 <div className="feed-time">{fmt(ev.created_at)}</div>
               </div>
             </div>
           ))}
+          {!related.length && <div className="empty small">No activity on this task yet</div>}
         </div>
 
-        <form className="sheet-comment" onSubmit={comment}>
-          <input placeholder="Add a note…" value={text} onChange={(e) => setText(e.target.value)} />
-          <button className="primary" disabled={!text.trim()}>Post</button>
+        <form className="sheet-comment" onSubmit={send}>
+          <div className="segmented tiny" role="tablist">
+            <button type="button" role="tab" aria-selected={mode === "nudge"} className={cls(mode === "nudge" && "on")} onClick={() => setMode("nudge")}>Steer agent</button>
+            <button type="button" role="tab" aria-selected={mode === "note"} className={cls(mode === "note" && "on")} onClick={() => setMode("note")}>Note only</button>
+          </div>
+          <div className="row">
+            <input
+              placeholder={mode === "nudge"
+                ? (task.assignee ? `Tell @${task.assignee} what to change…` : "Assign someone to steer them…")
+                : "Record a note on the timeline…"}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              aria-label={mode === "nudge" ? "Steer the agent" : "Add a note"}
+            />
+            <button className="primary" disabled={!text.trim() || busy}>{busy ? "…" : mode === "nudge" ? "Send" : "Post"}</button>
+          </div>
+          {mode === "nudge" && !task.assignee && <div className="hint">Nobody owns this task — the message will only be recorded.</div>}
         </form>
         <label className="attach"><input type="file" onChange={upload} />Attach file</label>
       </div>
