@@ -1,45 +1,45 @@
-# Mission Control — Coolify compose (server delta). API + Postgres.
-# Domain (set in Coolify): https://missions.blxmp.dk
+# RoundTable — Docker Compose (standalone)
+# Works on any Docker host. Backend image builds web/ (node stage) and serves
+# the SPA from FastAPI on :8000. Copy .env.example -> .env and fill secrets.
+
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: mcuser
-      POSTGRES_PASSWORD: ${MC_DB_PASSWORD:?set in Coolify envs}
-      POSTGRES_DB: mission_control
+      POSTGRES_USER: ${MC_DB_USER:-mcuser}
+      POSTGRES_PASSWORD: ${MC_DB_PASSWORD:?set MC_DB_PASSWORD in .env}
+      POSTGRES_DB: ${MC_DB_NAME:-roundtable}
     volumes:
-      - mc-postgres:/var/lib/postgresql/data
-    expose:
-      - "5432"
+      - rt-postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mcuser -d mission_control"]
+      test: ["CMD-SHELL", "pg_isready -U ${MC_DB_USER:-mcuser} -d ${MC_DB_NAME:-roundtable}"]
       interval: 10s
       timeout: 5s
       retries: 12
 
   api:
-    build:
-      context: https://github.com/wckdboy/mission-control.git#main
-    image: mission-control:local
+    build: .
+    image: roundtable:local
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg2://mcuser:${MC_DB_PASSWORD}@db:5432/mission_control
+      DATABASE_URL: postgresql+psycopg2://${MC_DB_USER:-mcuser}:${MC_DB_PASSWORD}@db:5432/${MC_DB_NAME:-roundtable}
       OPERATOR_USERNAME: ${MC_OPERATOR_USERNAME:-doomerius}
-      OPERATOR_PASSWORD: ${MC_OPERATOR_PASSWORD:?set in Coolify envs}
-      SESSION_SECRET: ${MC_SESSION_SECRET:?set in Coolify envs}
-      PUBLIC_BASE_URL: ${MC_PUBLIC_BASE_URL:-https://missions.blxmp.dk}
+      OPERATOR_PASSWORD: ${MC_OPERATOR_PASSWORD:?set MC_OPERATOR_PASSWORD in .env}
+      SESSION_SECRET: ${MC_SESSION_SECRET:?set MC_SESSION_SECRET in .env}
+      PUBLIC_BASE_URL: ${MC_PUBLIC_BASE_URL:-http://localhost:8000}
       AGENT_SEEDS: ${MC_AGENT_SEEDS:-jaeger=JAEGER=Data+Trials,percival=Percival=Evidence,bedivere=BEDIVERE=Integrity,galahad=GALAHAD=Coordination}
-      COOKIE_SECURE: "true"
-      CORS_ORIGINS: ${MC_CORS_ORIGINS:-https://missions.blxmp.dk}
+      COOKIE_SECURE: ${MC_COOKIE_SECURE:-false}
+      CORS_ORIGINS: ${MC_CORS_ORIGINS:-*}
+      DATA_DIR: /srv/data
     volumes:
-      - mc-data:/srv/data
-    expose:
-      - "8000"
+      - rt-data:/srv/data
+    ports:
+      - "${MC_PORT:-8000}:8000"
 
 volumes:
-  mc-postgres:
-  mc-data:
+  rt-postgres:
+  rt-data:

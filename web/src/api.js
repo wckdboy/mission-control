@@ -29,6 +29,7 @@ export const api = {
   createTask: (mid, t) => req("POST", `/api/missions/${mid}/tasks`, t),
   setTaskState: (tid, state) => req("PATCH", `/api/tasks/${tid}`, { state }),
   events: (mid) => req("GET", `/api/missions/${mid}/events`),
+  commentTask: (tid, text) => req("POST", `/api/tasks/${tid}/comments`, { text }),
   approvals: (mid) => req("GET", `/api/missions/${mid}/approvals?status=pending`),
   decideApproval: (aid, approve, note) =>
     req("POST", `/api/approvals/${aid}/decide`, { approve, note: note || "" }),

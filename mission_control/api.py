@@ -347,6 +347,42 @@ def list_artifacts(mission_id: int, db: Session = Depends(get_db)):
     return [artifact_out(a) for a in arts]
 
 
+@router.post("/tasks/{task_id}/artifacts", dependencies=[Depends(current_operator)])
+async def operator_upload_artifact(
+    task_id: int,
+    file: UploadFile = File(...),
+    kind: str = Form("file"),
+    name: str | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    t = _get_task(db, task_id)
+    content = await file.read()
+    mission_dir = Path(settings.data_dir) / "missions" / str(t.mission_id)
+    mission_dir.mkdir(parents=True, exist_ok=True)
+    filename = name or file.filename or f"{uuidlib.uuid4().hex}"
+    safe = Path(filename).name
+    storage = mission_dir / f"{uuidlib.uuid4().hex[:8]}-{safe}"
+    storage.write_bytes(content)
+    art = Artifact(
+        mission_id=t.mission_id,
+        task_id=t.id,
+        kind=kind,
+        name=safe,
+        storage_path=str(storage),
+        mime=file.content_type or "application/octet-stream",
+        size=len(content),
+    )
+    db.add(art)
+    db.commit()
+    db.refresh(art)
+    record_event(
+        db, t.mission_id, "human", None, "artifact.added",
+        {"artifact_id": art.id, "task_id": t.id, "name": art.name, "kind": art.kind},
+        task_id=t.id,
+    )
+    return artifact_out(art)
+
+
 @router.get("/artifacts/{artifact_id}/download")
 def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
     a = db.get(Artifact, artifact_id)
