@@ -146,6 +146,18 @@ def update_agent(agent_id: int, body: dict, db: Session = Depends(get_db)):
     return agent_out(a)
 
 
+@router.post("/agents/{agent_id}/issue-token", dependencies=[Depends(current_operator)])
+def issue_agent_token(agent_id: int, db: Session = Depends(get_db)):
+    """Rotate an agent token. Returns plaintext ONCE — store it securely."""
+    a = db.get(Agent, agent_id)
+    if not a:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    token = new_agent_token()
+    a.token_hash = sha256(token)
+    db.commit()
+    return {"agent": a.handle, "token": token}
+
+
 @router.post("/missions/{mission_id}/agents/{agent_id}", dependencies=[Depends(current_operator)])
 def add_agent_to_mission(mission_id: int, agent_id: int, db: Session = Depends(get_db)):
     m = _get_mission(db, mission_id)
