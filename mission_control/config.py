@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
     agent_seeds: str = ""
     data_dir: str = "./data"
+    frontend_dist: str = "./web/dist"
     cookie_secure: bool = False
     cors_origins: str = "*"
 
